@@ -51,13 +51,14 @@ class S3SecureBaseline:
         """
         # AWS Session の作成
         if profile:
-            session = boto3.Session(profile_name=profile)
-            self.s3_client = session.client("s3")
-            self.sts_client = session.client("sts")
+            self.session = boto3.Session(profile_name=profile)
+            self.s3_client = self.session.client("s3")
+            self.sts_client = self.session.client("sts")
             logger.info(f"AWSプロファイル '{profile}' を使用します")
         else:
-            self.s3_client = boto3.client("s3")
-            self.sts_client = boto3.client("sts")
+            self.session = boto3.Session()
+            self.s3_client = self.session.client("s3")
+            self.sts_client = self.session.client("sts")
 
         self.dry_run = dry_run
         self.exclude_buckets = exclude_buckets or []
@@ -71,8 +72,11 @@ class S3SecureBaseline:
         self.account_id = self._get_account_id()
         logger.info(f"AWSアカウントID: {self.account_id}")
 
-        # ログバケットの確認・作成
-        self._ensure_log_bucket()
+        # 作成済みのログバケット一覧を管理（リージョンごと）
+        self.created_log_buckets = set()
+
+        # リージョン別のS3クライアントをキャッシュ
+        self.regional_s3_clients = {}
 
     def _get_account_id(self) -> str:
         """AWSアカウントIDを取得"""
@@ -83,14 +87,30 @@ class S3SecureBaseline:
             logger.error(f"アカウントIDの取得に失敗しました: {e}")
             raise
 
-    def _ensure_log_bucket(self) -> bool:
-        """ログバケットの存在を確認し、なければ作成"""
-        log_bucket = f"access-logs-{self.account_id}"
+    def _get_regional_s3_client(self, region: str):
+        """指定されたリージョンのS3クライアントを取得（キャッシュ付き）"""
+        if region not in self.regional_s3_clients:
+            self.regional_s3_clients[region] = self.session.client(
+                "s3", region_name=region
+            )
+        return self.regional_s3_clients[region]
+
+    def _ensure_log_bucket(self, region: str) -> bool:
+        """指定リージョンのログバケットの存在を確認し、なければ作成"""
+        log_bucket = f"access-logs-{self.account_id}-{region}"
+
+        # 既に作成済みの場合はスキップ
+        if log_bucket in self.created_log_buckets:
+            return True
+
+        # リージョン固有のS3クライアントを取得
+        regional_client = self._get_regional_s3_client(region)
 
         try:
             # バケットの存在確認
-            self.s3_client.head_bucket(Bucket=log_bucket)
+            regional_client.head_bucket(Bucket=log_bucket)
             logger.info(f"ログバケット {log_bucket} は既に存在します")
+            self.created_log_buckets.add(log_bucket)
             return True
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
@@ -99,24 +119,20 @@ class S3SecureBaseline:
                 # バケットが存在しない場合
                 if self.dry_run:
                     logger.info(f"[DRY RUN] ログバケット {log_bucket} を作成します")
+                    self.created_log_buckets.add(log_bucket)
                     return True
 
                 try:
                     logger.info(f"ログバケット {log_bucket} を作成します...")
 
-                    # リージョンを取得
-                    session_region = self.s3_client.meta.region_name
-
-                    # バケットを作成
-                    if session_region == "us-east-1":
+                    # バケットを作成（リージョン固有のクライアントを使用）
+                    if region == "us-east-1":
                         # us-east-1の場合はLocationConstraintを指定しない
-                        self.s3_client.create_bucket(Bucket=log_bucket)
+                        regional_client.create_bucket(Bucket=log_bucket)
                     else:
-                        self.s3_client.create_bucket(
+                        regional_client.create_bucket(
                             Bucket=log_bucket,
-                            CreateBucketConfiguration={
-                                "LocationConstraint": session_region
-                            },
+                            CreateBucketConfiguration={"LocationConstraint": region},
                         )
 
                     # S3 Log Delivery Groupに権限を付与（バケットポリシーを使用）
@@ -149,11 +165,12 @@ class S3SecureBaseline:
                         ],
                     }
 
-                    self.s3_client.put_bucket_policy(
+                    regional_client.put_bucket_policy(
                         Bucket=log_bucket, Policy=json.dumps(log_bucket_policy)
                     )
 
                     logger.info(f"ログバケット {log_bucket} を作成しました")
+                    self.created_log_buckets.add(log_bucket)
                     return True
 
                 except ClientError as create_error:
@@ -172,10 +189,12 @@ class S3SecureBaseline:
             response = self.s3_client.list_buckets()
             buckets = [bucket["Name"] for bucket in response["Buckets"]]
 
-            # ログバケットを除外リストに追加
-            log_bucket = f"access-logs-{self.account_id}"
-            if log_bucket not in self.exclude_buckets:
-                self.exclude_buckets.append(log_bucket)
+            # ログバケットを除外リストに追加（access-logs-<アカウントID>-* パターン）
+            log_bucket_prefix = f"access-logs-{self.account_id}-"
+            for bucket in buckets:
+                if bucket.startswith(log_bucket_prefix):
+                    if bucket not in self.exclude_buckets:
+                        self.exclude_buckets.append(bucket)
 
             # 除外バケットをフィルタリング
             buckets = [b for b in buckets if b not in self.exclude_buckets]
@@ -185,6 +204,18 @@ class S3SecureBaseline:
         except ClientError as e:
             logger.error(f"バケット一覧の取得に失敗しました: {e}")
             return []
+
+    def get_bucket_region(self, bucket_name: str) -> str:
+        """バケットのリージョンを取得"""
+        try:
+            response = self.s3_client.get_bucket_location(Bucket=bucket_name)
+            location = response.get("LocationConstraint")
+            # us-east-1 の場合は None が返される
+            return location if location else "us-east-1"
+        except ClientError as e:
+            logger.error(f"バケット {bucket_name} のリージョン取得に失敗: {e}")
+            # デフォルトでクライアントのリージョンを返す
+            return self.s3_client.meta.region_name
 
     def get_bucket_policy(self, bucket_name: str) -> Optional[Dict]:
         """バケットポリシーを取得"""
@@ -353,7 +384,7 @@ class S3SecureBaseline:
         アクセスログの設定状態を取得
 
         Returns:
-            "enabled": 正しく設定済み (access-logs-<アカウントID>に正しいPrefixで出力)
+            "enabled": 正しく設定済み (access-logs-<アカウントID>-<リージョン>に正しいPrefixで出力)
             "enabled_other": 有効だが別の出力先または異なるPrefix
             "disabled": 無効
             "error": 取得エラー
@@ -363,11 +394,14 @@ class S3SecureBaseline:
             if "LoggingEnabled" not in response:
                 return "disabled"
 
+            # バケットのリージョンを取得
+            bucket_region = self.get_bucket_region(bucket_name)
+
             # 出力先とPrefixを確認
             target_bucket = response["LoggingEnabled"].get("TargetBucket", "")
             target_prefix = response["LoggingEnabled"].get("TargetPrefix", "")
 
-            expected_bucket = f"access-logs-{self.account_id}"
+            expected_bucket = f"access-logs-{self.account_id}-{bucket_region}"
             expected_prefix = f"AWSLogs/{self.account_id}/S3/"
 
             if target_bucket == expected_bucket and target_prefix == expected_prefix:
@@ -386,6 +420,16 @@ class S3SecureBaseline:
     def enable_access_logging(self, bucket_name: str) -> bool:
         """アクセスログを有効化"""
         try:
+            # バケットのリージョンを取得
+            bucket_region = self.get_bucket_region(bucket_name)
+
+            # そのリージョンのログバケットを確保
+            if not self._ensure_log_bucket(bucket_region):
+                logger.error(
+                    f"バケット {bucket_name}: ログバケットの作成に失敗しました"
+                )
+                return False
+
             logging_status = self.get_logging_status(bucket_name)
 
             # 現在の設定を取得（表示用）
@@ -404,8 +448,8 @@ class S3SecureBaseline:
                 )
                 return True
             elif logging_status == "enabled_other":
-                # ログ出力先バケット: access-logs-<アカウントID>
-                target_bucket = f"access-logs-{self.account_id}"
+                # ログ出力先バケット: access-logs-<アカウントID>-<リージョン>
+                target_bucket = f"access-logs-{self.account_id}-{bucket_region}"
 
                 # 新しい設定
                 new_logging_config = {
@@ -457,8 +501,8 @@ class S3SecureBaseline:
                 )
                 return True
 
-            # ログ出力先バケット: access-logs-<アカウントID>
-            target_bucket = f"access-logs-{self.account_id}"
+            # ログ出力先バケット: access-logs-<アカウントID>-<リージョン>
+            target_bucket = f"access-logs-{self.account_id}-{bucket_region}"
 
             # 新しい設定
             new_logging_config = {
