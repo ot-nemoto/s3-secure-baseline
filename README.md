@@ -130,8 +130,12 @@ python s3_secure_baseline.py --apply --logging-only
 ## 🧭 処理の流れ
 
 1. AWSアカウントIDを取得（`sts:GetCallerIdentity`）
-2. ログバケット（`access-logs-<アカウントID>`）の存在確認・必要に応じて作成
+2. ログバケット（`access-logs-<アカウントID>`）の存在確認・必要に応じて自動作成
+   - 作成時に **HTTP拒否ポリシー** と **ログ配信権限** を自動設定
+   - ログバケット自体は以降の処理対象から **自動的に除外**
 3. 対象バケット一覧を取得（`s3:ListAllMyBuckets`）
+   - ログバケットは除外済み
+   - `--exclude` オプションで指定されたバケットも除外
 4. 各バケットに対し以下を実行
    - `GetBucketPolicy` でバケットポリシーを取得
    - HTTP拒否ポリシー（`DenyInsecureTransport`）の完全性をチェック
@@ -270,8 +274,48 @@ my-bucket-3: ✗ 一部失敗
 
 **自動作成：**
 ログバケットが存在しない場合、以下の設定で自動作成されます：
+- **HTTP拒否ポリシー（DenyInsecureTransport）** を自動設定
+- **S3 ロギングサービスプリンシパル**（`logging.s3.amazonaws.com`）に `PutObject` 権限を付与
 - パブリックアクセスブロック有効
-- S3 ロギングサービスプリンシパル（`logging.s3.amazonaws.com`）に `PutObject` 権限を付与
+- **作成後は処理対象から自動的に除外**（ログの無限ループを防止）
+
+**ログバケットのポリシー例：**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3ServerAccessLogsPolicy",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "logging.s3.amazonaws.com"
+      },
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::access-logs-123456789012/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "123456789012"
+        }
+      }
+    },
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::access-logs-123456789012",
+        "arn:aws:s3:::access-logs-123456789012/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    }
+  ]
+}
+```
 
 ## 🧪 開発メモ
 
@@ -279,6 +323,10 @@ my-bucket-3: ✗ 一部失敗
 - 既に適切なポリシーや設定があるバケットは何も変更しません。
 - `--show-policy` / `--show-logging` を活用することで、事前に提案内容をレビューしてから適用できます。
 - 不完全なHTTP拒否ポリシー（`aws:SecureTransport` 条件はあるが `Action` や `Resource` が不足）は自動的に検出・削除され、完全なポリシーに置き換えられます。
+- **ログバケット自体は処理対象から自動除外**されるため、以下のメリットがあります：
+  - ログの無限ループを防止（ログバケットのログをログバケットに保存しない）
+  - `--exclude` でログバケットを明示的に指定する必要がない
+  - ログバケットは作成時に既にセキュアな状態で構成済み
 
 **👉 推奨運用：**
 
@@ -286,6 +334,7 @@ my-bucket-3: ✗ 一部失敗
 2. レビュー後に `--apply` で一括反映
 3. 新規バケット対応のため、CI や Lambda 定期実行にも組み込み可能
 4. 部分適用が必要な場合は `--http-only` または `--logging-only` を活用
+5. ログバケット（`access-logs-<アカウントID>`）は自動的に除外されるため、特別な設定は不要
 
 ## 🧼 参考情報
 

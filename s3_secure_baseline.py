@@ -172,6 +172,11 @@ class S3SecureBaseline:
             response = self.s3_client.list_buckets()
             buckets = [bucket["Name"] for bucket in response["Buckets"]]
 
+            # ログバケットを除外リストに追加
+            log_bucket = f"access-logs-{self.account_id}"
+            if log_bucket not in self.exclude_buckets:
+                self.exclude_buckets.append(log_bucket)
+
             # 除外バケットをフィルタリング
             buckets = [b for b in buckets if b not in self.exclude_buckets]
 
